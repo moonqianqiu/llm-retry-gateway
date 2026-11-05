@@ -33,6 +33,8 @@ go build -o llm-retry-gateway.exe .
 ./llm-retry-gateway -config config.json
 ```
 
+Windows 下也可直接运行 `build.bat`（先 `go vet ./...`，再带 `-trimpath -ldflags "-s -w"` 构建）。
+
 `-config` 默认 `config.json`，**相对进程工作目录 CWD**；文件不存在或无法解析会打印错误并退出，**不会静默回退默认值**。
 
 ### 配置 Agent
