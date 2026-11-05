@@ -350,6 +350,19 @@ func TestDefaultConfigIsValid(t *testing.T) {
 	}
 }
 
+func TestRepoConfigFileLoads(t *testing.T) {
+	cfg, err := loadConfig("config.json")
+	if err != nil {
+		t.Fatalf("shipped config.json does not load: %v", err)
+	}
+	if cfg.AllowHttp {
+		t.Error("shipped config must default allowHttp to false")
+	}
+	if cfg.Listen != "127.0.0.1:18888" || cfg.MaxBodyBytes != 262144 || cfg.RetryAfterCapRatio != 4 {
+		t.Errorf("shipped config drifted: %+v", cfg)
+	}
+}
+
 func TestValidateConfigRejects(t *testing.T) {
 	cases := []struct {
 		name   string
