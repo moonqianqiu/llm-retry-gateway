@@ -1,0 +1,29 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Built gateway binary
+llm-retry-gateway
+llm-retry-gateway.exe
+
+# Go test artifacts
+*.test
+*.out
+coverage.out
+coverage.txt
+*.coverprofile
+*.cover
+
+# Editor / OS junk
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local scratch
+*.log
+tmp/
