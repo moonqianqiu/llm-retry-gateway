@@ -1,0 +1,9 @@
+# Go 源码统一 LF。Windows runner 默认 core.autocrlf=true，会把 checkout 的
+# .go 文件转成 CRLF，导致 CI/Release 里的 `gofmt -l .` 误报并失败。
+* text=auto
+*.go   text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.bat  text eol=crlf
