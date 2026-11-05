@@ -1,5 +1,9 @@
 # llm-retry-gateway
 
+[![CI](https://github.com/moonqianqiu/llm-retry-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/moonqianqiu/llm-retry-gateway/actions/workflows/ci.yml)
+[![Release](https://github.com/moonqianqiu/llm-retry-gateway/actions/workflows/release.yml/badge.svg)](https://github.com/moonqianqiu/llm-retry-gateway/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 本地单文件 Go HTTP 代理网关。把 OpenAI 兼容客户端的 base URL 指向网关，网关从请求路径里剥出真实上游地址并转发；**仅对 `/chat/completions` 的 HTTP 429 做无限自动重试**。
 
 ```text
@@ -25,6 +29,21 @@ Go 标准库 only，单文件 `main.go`，无第三方依赖，不管理任何 A
 ---
 
 ## 快速开始
+
+### 获取代码或二进制
+
+```bash
+git clone https://github.com/moonqianqiu/llm-retry-gateway.git
+cd llm-retry-gateway
+```
+
+也可以直接从 [Releases](https://github.com/moonqianqiu/llm-retry-gateway/releases) 下载预编译的 `llm-retry-gateway.exe`（附 `SHA256SUMS.txt` 校验），跳过构建步骤。Release 产物由 GitHub Actions 用
+
+```bash
+go build -trimpath -ldflags "-s -w" -o llm-retry-gateway.exe
+```
+
+构建。
 
 ### 构建与运行
 
@@ -223,6 +242,24 @@ go test ./... -v
 
 ---
 
+## CI 与 Release
+
+| 工作流 | 触发 | 做什么 |
+| :--- | :--- | :--- |
+| `ci.yml` | push / PR 到 `master` | `gofmt` 检查 + `go vet ./...` + `go test ./... -count=1`，`ubuntu-latest` 与 `windows-latest` 双平台 |
+| `release.yml` | 推送 `v*` tag；也可手动 `workflow_dispatch`（需填已存在的 tag 名） | 在 `windows-latest` 上 vet/test → 用上述命令构建 exe → 生成 `SHA256SUMS.txt` → 用 `gh release create --generate-notes` 建 Release 并上传两个产物 |
+
+发一个版本：
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+`release.yml` 显式声明了 `permissions: contents: write`——仓库默认的 workflow 权限是只读，不声明会导致创建 Release 失败。
+
+---
+
 ## 已知限制
 
 - 只覆盖 `/chat/completions`；不覆盖新版 `/responses` API，也不匹配带尾部斜杠的 `/chat/completions/`。chat 路径固定 `POST`。
@@ -255,3 +292,9 @@ Key 池 / 轮换 / 降级、主动限流、配置热重载、Web UI、完整 SSE
 10. streamResponse / copyHeader / delHopByHop / writeJSONError
 11. newRequestID / maxInt
 ```
+
+---
+
+## License
+
+MIT — 见 [LICENSE](LICENSE)。

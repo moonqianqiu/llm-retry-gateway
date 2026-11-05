@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify
+        shell: bash
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "The following files are not gofmt-formatted:"
+            gofmt -l .
+            exit 1
+          fi
+          go vet ./...
+          go test ./... -count=1
+
+      - name: Build
+        shell: bash
+        run: |
+          go build -trimpath -ldflags "-s -w" -o llm-retry-gateway.exe
+
+      - name: Checksum
+        shell: bash
+        run: |
+          sha256sum llm-retry-gateway.exe > SHA256SUMS.txt
+
+      - name: Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release create "$TAG" llm-retry-gateway.exe SHA256SUMS.txt --title "$TAG" --generate-notes
