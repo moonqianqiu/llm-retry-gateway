@@ -122,6 +122,9 @@ retryAfterCapped = min(parseRetryAfter(Retry-After), 所选 ramp 的 max(delaysM
 rampDelay        = computeRampDelay(ramp, rampIndex)
 delay            = max(retryAfterCapped, rampDelay)      # Retry-After 是下限
 rampIndex++                                             # 恒递增
+delay = decideDelay(retryAfterCapped, rampDelay, min(delaysMs), jitterRatio, smallRetryAfterFixed)
+      ├─ smallRetryAfterFixed && 0 < retryAfterCapped <= min(delaysMs) → min(delaysMs) × 抖动
+      └─ 否则                                                          → max(retryAfterCapped, rampDelay)
 ```
 
 - 正常 ramp 封顶 `10000 × 4 = 40s`；模糊 ramp 封顶 `30000 × 4 = 120s`。
@@ -130,6 +133,8 @@ rampIndex++                                             # 恒递增
   - 持续 `Retry-After: 60s`（normalRamp）→ `min(60s,40s)=40s`，缓坡恒 ≤10s，`delay` **恒为 40s**，表现为「被 Retry-After 压住」。
   - 持续 `Retry-After: 1` → `delay` 为 `2,2,3,3,3,4.5,4.5,6.75,10,2,...`，锯齿生效。
 - 退出条件：客户端断开（静默返回、不写响应）、拿到非 429 响应、明确配额耗尽；网络错误另走 502。
+
+**`smallRetryAfterFixed: true` 的额外分支**：当上游 `Retry-After` 解析成功、值 `> 0`、且 **`<=`** 所选 ramp 的 `min(delaysMs)` 时，延迟直接取 `min(delaysMs) × 抖动`，**不与 `rampDelay` 取 `max`**，即跳过爬坡序列。适用于「按秒补充令牌桶」型上游（如持续 `Retry-After: 1` 或 `2`），避免被 ramp 的 2s/3s/4.5s 拖慢。`rampIndex` 仍恒递增，因此 fixed 结束后不会从 ramp 头部重新开始。
 
 ### 5. 阶段二透传
 
@@ -196,6 +201,8 @@ Te, Trailer, Transfer-Encoding, Upgrade, Proxy-Connection
 | `ambiguousRamp.delaysMs` | []int | 见示例 | 模糊配额退避序列，循环使用 |
 | `ambiguousRamp.jitterRatio` | float | `0.25` | 同上 |
 | `retryAfterCapRatio` | int | `4` | `Retry-After` 封顶比例，封顶 = 所选 ramp 的 `max(delaysMs) × 该值` |
+| `responseHeaderTimeoutSec` | int | `120` | 等上游响应头的超时秒数；覆盖建连后到响应头之间，不掐断 SSE 长流。超时 → 502 |
+| `smallRetryAfterFixed` | bool | `false` | `true` 时：若 `Retry-After > 0` 且 **`<=`** 所选 ramp 的 `min(delaysMs)`，延迟固定为 `min(delaysMs) × [1-jitterRatio, 1+jitterRatio]`，跳过 ramp 爬坡；其余情况仍走 `max(capped, rampDelay)`。`false` 为原行为 |
 | `quotaExhaustedPatterns` | []string | 见示例 | 明确配额耗尽子串（大小写不敏感） |
 | `rateLimitPatterns` | []string | 见示例 | 明确瞬时限流子串（大小写不敏感） |
 
@@ -266,7 +273,7 @@ git push origin v0.1.0
 - 429 配额耗尽响应体固定截断到前 64KB，**非字节级透传**；`Content-Length` 按截断后长度重写。
 - 压缩 429：网关原样转发客户端的 `Accept-Encoding`，Go Transport 此时不会自动解压；若上游返回 gzip 压缩的 429，分类器拿到的是压缩字节，会退化为 `ClassUnclassified`（走 `normalRamp`）。这是可接受降级——429 响应通常很小、很多上游不压缩；需要覆盖时可临时关掉客户端的 `Accept-Encoding`。**不要删除响应头的 `Content-Encoding`**。
 - 429 响应体截断时是提前 `Close`（未读到 EOF），该连接不会归还共享连接池；错误响应场景可接受。
-- 网络错误不重试：上游建连后 60s 不发响应头会触发 `ResponseHeaderTimeout` → 502（该超时只覆盖到响应头，不会掐断 SSE 长流）。
+- 网络错误不重试：上游建连后默认 120s（`responseHeaderTimeoutSec`）不发响应头会触发超时 → 502（该超时只覆盖到响应头，不会掐断 SSE 长流）。调大前务必确认 agent SDK 的整请求 timeout ≥ 2–3 倍单次尝试时间，否则 SDK 会先超时、客户端看不到 502。挂起连接会占满 `responseHeaderTimeoutSec`，加剧并发压力。
 - 空 `allowedUpstreamHosts` 默认允许任意上游：回环监听下本机网页可借网关盲打内网。共享机器请务必配置白名单。
 
 ---
@@ -283,7 +290,7 @@ Key 池 / 轮换 / 降级、主动限流、配置热重载、Web UI、完整 SSE
 1.  imports（crand "crypto/rand" + mrand "math/rand" 别名；min/max 用 Go 1.21+ 内建）
 2.  常量：hopByHopHeaders、max429BodyBytes、错误消息、gatewayError
 3.  类型：Config, RampConfig, Classification, Logger, LogLevel
-4.  包级 upstreamClient = newHTTPClient()（ResponseHeaderTimeout 60s、CheckRedirect）
+4.  newHTTPClient(respHeaderTimeout)（ResponseHeaderTimeout 由配置传入、CheckRedirect）；client 在 main() 构造后经参数传递，无包级变量
 5.  main / loadConfig / validateConfig / errCh + select 优雅关闭
 6.  handle / extractUpstreamURL / normalizeHost / handleChat / handlePassthrough
 7.  forwardWithRetry / buildSyntheticResponse

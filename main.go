@@ -65,16 +65,18 @@ type RampConfig struct {
 }
 
 type Config struct {
-	Listen                 string     `json:"listen"`
-	AllowHttp              bool       `json:"allowHttp"`
-	AllowedUpstreamHosts   []string   `json:"allowedUpstreamHosts"`
-	MaxBodyBytes           int        `json:"maxBodyBytes"`
-	LogLevel               string     `json:"logLevel"`
-	NormalRamp             RampConfig `json:"normalRamp"`
-	AmbiguousRamp          RampConfig `json:"ambiguousRamp"`
-	RetryAfterCapRatio     int        `json:"retryAfterCapRatio"`
-	QuotaExhaustedPatterns []string   `json:"quotaExhaustedPatterns"`
-	RateLimitPatterns      []string   `json:"rateLimitPatterns"`
+	Listen                   string     `json:"listen"`
+	AllowHttp                bool       `json:"allowHttp"`
+	AllowedUpstreamHosts     []string   `json:"allowedUpstreamHosts"`
+	MaxBodyBytes             int        `json:"maxBodyBytes"`
+	LogLevel                 string     `json:"logLevel"`
+	NormalRamp               RampConfig `json:"normalRamp"`
+	AmbiguousRamp            RampConfig `json:"ambiguousRamp"`
+	RetryAfterCapRatio       int        `json:"retryAfterCapRatio"`
+	ResponseHeaderTimeoutSec int        `json:"responseHeaderTimeoutSec"`
+	SmallRetryAfterFixed     bool       `json:"smallRetryAfterFixed"`
+	QuotaExhaustedPatterns   []string   `json:"quotaExhaustedPatterns"`
+	RateLimitPatterns        []string   `json:"rateLimitPatterns"`
 }
 
 type Classification int
@@ -149,9 +151,9 @@ func parseLogLevel(s string) LogLevel {
 //    Clone() 产生新连接池）
 // ---------------------------------------------------------------------------
 
-func newHTTPClient() *http.Client {
+func newHTTPClient(respHeaderTimeout time.Duration) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ResponseHeaderTimeout = 60 * time.Second
+	tr.ResponseHeaderTimeout = respHeaderTimeout
 	return &http.Client{
 		Transport: tr,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -159,8 +161,6 @@ func newHTTPClient() *http.Client {
 		},
 	}
 }
-
-var upstreamClient = newHTTPClient()
 
 // ---------------------------------------------------------------------------
 // 5. main / 配置
@@ -181,7 +181,9 @@ func defaultConfig() *Config {
 			DelaysMs:    []int{4000, 6000, 9000, 13500, 20250, 30000},
 			JitterRatio: 0.25,
 		},
-		RetryAfterCapRatio: 4,
+		RetryAfterCapRatio:       4,
+		ResponseHeaderTimeoutSec: 120,
+		SmallRetryAfterFixed:     false,
 		QuotaExhaustedPatterns: []string{
 			"credit_balance_exhausted",
 			"organization_usage_limit_exceeded",
@@ -240,6 +242,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.RetryAfterCapRatio < 1 {
 		return fmt.Errorf("retryAfterCapRatio must be >= 1, got %d", cfg.RetryAfterCapRatio)
 	}
+	if cfg.ResponseHeaderTimeoutSec < 1 {
+		return fmt.Errorf("responseHeaderTimeoutSec must be >= 1, got %d", cfg.ResponseHeaderTimeoutSec)
+	}
 	for name, ramp := range map[string]RampConfig{
 		"normalRamp":    cfg.NormalRamp,
 		"ambiguousRamp": cfg.AmbiguousRamp,
@@ -274,10 +279,15 @@ func main() {
 		logger.Warn("allowedUpstreamHosts is empty; gateway will forward to ANY host including internal network. Set it to a whitelist if this machine is shared.")
 	}
 
+	// 按配置构造上游 client，经参数传递给各 handler，不使用包级变量。
+	respHeaderTimeout := time.Duration(cfg.ResponseHeaderTimeoutSec) * time.Second
+	client := newHTTPClient(respHeaderTimeout)
+	logger.Info("response_header_timeout=%s", respHeaderTimeout)
+
 	srv := &http.Server{
 		Addr: cfg.Listen,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handle(w, r, cfg, logger)
+			handle(w, r, cfg, logger, client)
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -311,7 +321,7 @@ func main() {
 // 6. 请求处理
 // ---------------------------------------------------------------------------
 
-func handle(w http.ResponseWriter, r *http.Request, cfg *Config, logger *Logger) {
+func handle(w http.ResponseWriter, r *http.Request, cfg *Config, logger *Logger, client *http.Client) {
 	u, err := extractUpstreamURL(r, cfg)
 	if err != nil {
 		if ge, ok := err.(*gatewayError); ok {
@@ -322,9 +332,9 @@ func handle(w http.ResponseWriter, r *http.Request, cfg *Config, logger *Logger)
 		return
 	}
 	if strings.HasSuffix(u.Path, "/chat/completions") {
-		handleChat(w, r, u, cfg, logger)
+		handleChat(w, r, u, cfg, logger, client)
 	} else {
-		handlePassthrough(w, r, u, cfg, logger)
+		handlePassthrough(w, r, u, cfg, logger, client)
 	}
 }
 
@@ -397,7 +407,7 @@ func normalizeHost(h string) string {
 	return strings.TrimSuffix(h, ".")
 }
 
-func handleChat(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *Config, logger *Logger) {
+func handleChat(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *Config, logger *Logger, client *http.Client) {
 	ctx := r.Context()
 	reqID := newRequestID()
 
@@ -411,7 +421,7 @@ func handleChat(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *Config,
 		return
 	}
 
-	resp, err := forwardWithRetry(ctx, u.String(), bodyBytes, r.Header, cfg, logger, reqID)
+	resp, err := forwardWithRetry(ctx, u.String(), bodyBytes, r.Header, cfg, logger, reqID, client)
 	if err != nil {
 		if ctx.Err() != nil {
 			return // 客户端已断，不写任何响应
@@ -424,7 +434,7 @@ func handleChat(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *Config,
 	streamResponse(w, resp, logger, reqID)
 }
 
-func handlePassthrough(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *Config, logger *Logger) {
+func handlePassthrough(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *Config, logger *Logger, client *http.Client) {
 	ctx := r.Context()
 	reqID := newRequestID()
 
@@ -440,7 +450,7 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *
 	req.Header.Del("Content-Length")
 	delHopByHop(req.Header)
 
-	resp, err := upstreamClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return
@@ -458,7 +468,7 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *
 // ---------------------------------------------------------------------------
 
 func forwardWithRetry(ctx context.Context, upstreamURL string, bodyBytes []byte,
-	originalHeader http.Header, cfg *Config, logger *Logger, reqID string) (*http.Response, error) {
+	originalHeader http.Header, cfg *Config, logger *Logger, reqID string, client *http.Client) (*http.Response, error) {
 
 	attempt := 0
 	rampIndex := 0
@@ -480,7 +490,7 @@ func forwardWithRetry(ctx context.Context, upstreamURL string, bodyBytes []byte,
 		delHopByHop(req.Header)
 		// Authorization 已在 originalHeader 中，copyHeader 已透传。
 
-		resp, err := upstreamClient.Do(req)
+		resp, err := client.Do(req)
 		if ctx.Err() != nil {
 			if resp != nil {
 				resp.Body.Close()
@@ -521,11 +531,13 @@ func forwardWithRetry(ctx context.Context, upstreamURL string, bodyBytes []byte,
 			}
 		}
 		rampDelay := computeRampDelay(ramp, rampIndex)
-		delay := max(capped, rampDelay) // Retry-After 是下限；max 为 Go 1.21+ 内建
-		rampIndex++                     // 无论是否使用 Retry-After 都递增
+		minDelayMs := minInt(ramp.DelaysMs)
+		delay := decideDelay(capped, rampDelay, minDelayMs, ramp.JitterRatio, cfg.SmallRetryAfterFixed)
+		rampIndex++ // 无论是否使用 Retry-After 都递增
 
-		logger.Info("req=%s attempt=%d sleep_ms=%d before_attempt=%d",
-			reqID, attempt, delay.Milliseconds(), attempt+1)
+		logger.Info("req=%s attempt=%d sleep_ms=%d small_ra_fixed=%v capped_ms=%d ramp_ms=%d min_ms=%d before_attempt=%d",
+			reqID, attempt, delay.Milliseconds(), cfg.SmallRetryAfterFixed,
+			capped.Milliseconds(), rampDelay.Milliseconds(), minDelayMs, attempt+1)
 		if !sleepWithContext(ctx, delay) {
 			return nil, ctx.Err()
 		}
@@ -644,9 +656,26 @@ func readLimited(body io.Reader, limit int) ([]byte, error) {
 // 9. 退避计算
 // ---------------------------------------------------------------------------
 
+// decideDelay 计算重试前的等待时间。
+// 当 fixed 为 true 且上游 Retry-After 解析结果 <= 所选 ramp 的 min(delaysMs) 时，
+// 延迟固定为 min(delaysMs)×抖动，不再与 rampDelay 取 max（即跳过爬坡序列）；
+// 其余情况保持 max(capped, rampDelay)。抽取为纯函数以便单测覆盖两条分支。
+func decideDelay(capped, rampDelay time.Duration, minDelayMs int, jitterRatio float64, fixed bool) time.Duration {
+	if fixed && capped > 0 && capped <= time.Duration(minDelayMs)*time.Millisecond {
+		return jitterDuration(minDelayMs, jitterRatio)
+	}
+	return max(capped, rampDelay)
+}
+
 func computeRampDelay(ramp *RampConfig, index int) time.Duration {
 	v := ramp.DelaysMs[index%len(ramp.DelaysMs)]
-	jitter := float64(v) * ramp.JitterRatio
+	return jitterDuration(v, ramp.JitterRatio)
+}
+
+// jitterDuration 返回 v×(1±ratio) 的随机时长，保底非负。
+// computeRampDelay 与 decideDelay 共用同一抖动公式，保证语义一致。
+func jitterDuration(v int, ratio float64) time.Duration {
+	jitter := float64(v) * ratio
 	actual := float64(v) - jitter + mrand.Float64()*2*jitter
 	if actual < 0 {
 		actual = 0
@@ -741,6 +770,16 @@ func newRequestID() string {
 	b := make([]byte, 4)
 	crand.Read(b)
 	return fmt.Sprintf("%x", b)
+}
+
+func minInt(xs []int) int {
+	m := xs[0]
+	for _, v := range xs[1:] {
+		if v < m {
+			m = v
+		}
+	}
+	return m
 }
 
 func maxInt(xs []int) int {

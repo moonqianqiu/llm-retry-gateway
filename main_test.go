@@ -33,8 +33,9 @@ func testConfig() *Config {
 
 func startGateway(t *testing.T, cfg *Config) *httptest.Server {
 	t.Helper()
+	client := newHTTPClient(10 * time.Second) // 测试专用 10s 超时，与生产配置解耦
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handle(w, r, cfg, testLogger())
+		handle(w, r, cfg, testLogger(), client)
 	}))
 }
 
@@ -200,6 +201,46 @@ func TestComputeRampDelay(t *testing.T) {
 		if d < 750*time.Millisecond || d > 1250*time.Millisecond {
 			t.Fatalf("jitter out of range: %v", d)
 		}
+	}
+}
+
+func TestDecideDelay(t *testing.T) {
+	// normalRamp: min=2000, jitter=0.25 → fixed 分支范围 [1500,2500]
+	const minMs = 2000
+	const ratio = 0.25
+	rampDelay := 2500 * time.Millisecond
+
+	cases := []struct {
+		name      string
+		capped    time.Duration
+		rampDelay time.Duration
+		fixed     bool
+		wantExact time.Duration // 0 表示走范围断言
+		wantRange [2]time.Duration
+	}{
+		{"fixed=false capped=1s", 1 * time.Second, rampDelay, false, rampDelay, [2]time.Duration{}},
+		{"fixed=true capped=1s", 1 * time.Second, rampDelay, true, 0, [2]time.Duration{1500 * time.Millisecond, 2500 * time.Millisecond}},
+		{"fixed=true capped==min(2s)", 2 * time.Second, rampDelay, true, 0, [2]time.Duration{1500 * time.Millisecond, 2500 * time.Millisecond}}, // ≤ 改动：2s == min 也触发
+		{"fixed=true capped=0", 0, rampDelay, true, rampDelay, [2]time.Duration{}},
+		{"fixed=true capped=3s", 3 * time.Second, rampDelay, true, 3 * time.Second, [2]time.Duration{}}, // 3s > min，不触发
+		{"fixed=true capped=5s", 5 * time.Second, rampDelay, true, 5 * time.Second, [2]time.Duration{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantRange == [2]time.Duration{} {
+				if got := decideDelay(tc.capped, tc.rampDelay, minMs, ratio, tc.fixed); got != tc.wantExact {
+					t.Fatalf("got %v, want %v", got, tc.wantExact)
+				}
+				return
+			}
+			for i := 0; i < 100; i++ {
+				got := decideDelay(tc.capped, tc.rampDelay, minMs, ratio, tc.fixed)
+				if got < tc.wantRange[0] || got > tc.wantRange[1] {
+					t.Fatalf("iter %d: got %v, want in [%v,%v]", i, got, tc.wantRange[0], tc.wantRange[1])
+				}
+			}
+		})
 	}
 }
 
@@ -375,6 +416,7 @@ func TestValidateConfigRejects(t *testing.T) {
 		{"empty ramp", func(c *Config) { c.NormalRamp.DelaysMs = nil }},
 		{"zero delay", func(c *Config) { c.NormalRamp.DelaysMs = []int{0} }},
 		{"jitter > 1", func(c *Config) { c.AmbiguousRamp.JitterRatio = 1.5 }},
+		{"responseHeaderTimeoutSec=0", func(c *Config) { c.ResponseHeaderTimeoutSec = 0 }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

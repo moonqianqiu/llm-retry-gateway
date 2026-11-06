@@ -13,6 +13,8 @@
     "jitterRatio": 0.25
   },
   "retryAfterCapRatio": 4,
+  "responseHeaderTimeoutSec": 120,
+  "smallRetryAfterFixed": false,
   "quotaExhaustedPatterns": [
     "credit_balance_exhausted",
     "organization_usage_limit_exceeded",
