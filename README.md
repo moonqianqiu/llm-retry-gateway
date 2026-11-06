@@ -18,7 +18,7 @@ Go 标准库 only，单文件 `main.go`，无第三方依赖，不管理任何 A
 
 ## 特性
 
-- **只有 429 重试**，无限次，无 `maxRetries`；网络错误不重放非幂等 `POST`，直接 502。
+- **只有 429 重试，5xx 有限重试**：429 无限次、无 `maxRetries`；502/503/504 走 `max5xxRetries`（默认 `0` 不重试），耗尽后 HTML 错误页包装为 OpenAI 兼容 JSON，防 Agent SDK 解析崩溃；网络错误不重放非幂等 `POST`，直接 502。
 - **首字节前可重试，首字节后不回头**：`WriteHeader` 之后只做流式透传，绝不重试。
 - **分类驱动退避**：明确配额耗尽 / 明确瞬时限流 / 模糊配额 / 未分类，四类走不同 ramp。
 - **`Retry-After` 是延迟下限**（不是「优先使用」，`smallRetryAfterFixed: false` 时）：`delay = max(封顶后的 Retry-After, 缓坡延迟)`，缓坡保证退避不会永远卡在 1 秒。
@@ -138,6 +138,8 @@ delay = decideDelay(retryAfterCapped, rampDelay, min(delaysMs), jitterRatio, sma
 
 **`smallRetryAfterFixed: true` 的额外分支**：当上游 `Retry-After` 解析成功、值 `> 0`、且 **`<=`** 所选 ramp 的 `min(delaysMs)` 时，延迟直接取 `min(delaysMs) × 抖动`，**不与 `rampDelay` 取 `max`**，即跳过爬坡序列。适用于「按秒补充令牌桶」型上游（如持续 `Retry-After: 1` 或 `2`），避免被 ramp 的 2s/3s/4.5s 拖慢。`rampIndex` 仍恒递增，因此 fixed 结束后不会从 ramp 头部重新开始。
 
+**5xx（502/503/504）的处理**：走 `max5xxRetries` 有限重试（默认 `0` 即不重试），延迟复用与 429 相同的 `max(capped, rampDelay)`（含 `Retry-After` 封顶），退避 ramp 用 `normalRamp`，`rampIndex` 与 429 共享递增。重试耗尽后，若响应体含 `<html` / `<!doctype html`（大小写不敏感），拦截并包装为 OpenAI 兼容 JSON：`{"error":{"message":"Upstream returned <code> with an HTML error page; intercepted and wrapped by llm-retry-gateway.","type":"upstream_error"}}`，`Content-Type` 覆写为 `application/json; charset=utf-8`；非 HTML 响应体原样透传。**该逻辑仅覆盖 chat 路径**；passthrough 路径的 5xx 仍原样透传、不重试。
+
 ### 5. 阶段二透传
 
 删除逐跳头后 `copyHeader` + `WriteHeader`，随后用 32KB buffer 循环读写并 `Flusher.Flush()`，保证 SSE 逐块到达。
@@ -173,6 +175,9 @@ Te, Trailer, Transfer-Encoding, Upgrade, Proxy-Connection
     "jitterRatio": 0.25
   },
   "retryAfterCapRatio": 4,
+  "responseHeaderTimeoutSec": 65,
+  "smallRetryAfterFixed": false,
+  "max5xxRetries": 0,
   "quotaExhaustedPatterns": [
     "credit_balance_exhausted",
     "organization_usage_limit_exceeded",
@@ -203,14 +208,15 @@ Te, Trailer, Transfer-Encoding, Upgrade, Proxy-Connection
 | `ambiguousRamp.delaysMs` | []int | 见示例 | 模糊配额退避序列，循环使用 |
 | `ambiguousRamp.jitterRatio` | float | `0.25` | 同上 |
 | `retryAfterCapRatio` | int | `4` | `Retry-After` 封顶比例，封顶 = 所选 ramp 的 `max(delaysMs) × 该值` |
-| `responseHeaderTimeoutSec` | int | `120` | 等上游响应头的超时秒数；覆盖建连后到响应头之间，不掐断 SSE 长流。超时 → 502 |
+| `responseHeaderTimeoutSec` | int | `120`（shipped `config.json` 为 `65`） | 等上游响应头的超时秒数；覆盖建连后到响应头之间，不掐断 SSE 长流。超时 → 502。上游若在 ~60s 内必然回 504（如 Azure Application Gateway），可调小到 65 免得对死连接傻等 |
 | `smallRetryAfterFixed` | bool | `false` | `true` 时：若 `Retry-After > 0` 且 **`<=`** 所选 ramp 的 `min(delaysMs)`，延迟固定为 `min(delaysMs) × [1-jitterRatio, 1+jitterRatio]`，跳过 ramp 爬坡；其余情况仍走 `max(capped, rampDelay)`。`false` 为原行为 |
+| `max5xxRetries` | int | `0` | 上游返回 502/503/504 时的最大重试次数（走 normalRamp 退避，与 429 共享 `rampIndex`，尊重 `Retry-After`）。重试耗尽后：响应体为 HTML 则拦截并包装为 OpenAI 兼容 JSON 错误，否则原样透传 |
 | `quotaExhaustedPatterns` | []string | 见示例 | 明确配额耗尽子串（大小写不敏感） |
 | `rateLimitPatterns` | []string | 见示例 | 明确瞬时限流子串（大小写不敏感） |
 
 **加载顺序**：默认值 → `config.json` → 环境变量 `LISTEN` / `LOG_LEVEL`。
 
-**启动校验**（任一失败即退出）：配置文件存在且可解析；`listen` 为回环地址；`maxBodyBytes >= 1024`；`retryAfterCapRatio >= 1`；`responseHeaderTimeoutSec >= 1`；两个 ramp 的 `delaysMs` 非空且全部 `> 0`、`jitterRatio ∈ [0,1]`。
+**启动校验**（任一失败即退出）：配置文件存在且可解析；`listen` 为回环地址；`maxBodyBytes >= 1024`；`retryAfterCapRatio >= 1`；`responseHeaderTimeoutSec >= 1`；`max5xxRetries >= 0`；两个 ramp 的 `delaysMs` 非空且全部 `> 0`、`jitterRatio ∈ [0,1]`。
 
 `max429BodyBytes` 是编译期常量 `64 * 1024`，**不是配置项**：429 响应体读取上限与请求体上限解耦，分类只需 body 前缀做子串匹配。
 
@@ -275,7 +281,10 @@ git push origin v0.1.0
 - 429 配额耗尽响应体固定截断到前 64KB，**非字节级透传**；`Content-Length` 按截断后长度重写。
 - 压缩 429：网关原样转发客户端的 `Accept-Encoding`，Go Transport 此时不会自动解压；若上游返回 gzip 压缩的 429，分类器拿到的是压缩字节，会退化为 `ClassUnclassified`（走 `normalRamp`）。这是可接受降级——429 响应通常很小、很多上游不压缩；需要覆盖时可临时关掉客户端的 `Accept-Encoding`。**不要删除响应头的 `Content-Encoding`**。
 - 429 响应体截断时是提前 `Close`（未读到 EOF），该连接不会归还共享连接池；错误响应场景可接受。
-- 网络错误不重试：上游建连后默认 120s（`responseHeaderTimeoutSec`）不发响应头会触发超时 → 502（该超时只覆盖到响应头，不会掐断 SSE 长流）。调大前务必确认 agent SDK 的整请求 timeout ≥ 2–3 倍单次尝试时间，否则 SDK 会先超时、客户端看不到 502。挂起连接会占满 `responseHeaderTimeoutSec`，加剧并发压力。
+- 网络错误不重试：上游建连后不发响应头会触发 `responseHeaderTimeoutSec` 超时 → 502（代码默认 120s，shipped `config.json` 为 65s，适配 ~60s 内必然回 504 的快速失败上游；该超时只覆盖到响应头，不会掐断 SSE 长流）。调大前务必确认 agent SDK 的整请求 timeout ≥ 2–3 倍单次尝试时间，否则 SDK 会先超时、客户端看不到 502。挂起连接会占满 `responseHeaderTimeoutSec`，加剧并发压力。
+- 5xx 重试耗时警告：上游 504 往往是上游内部等了 ~60s 才返回。`max5xxRetries` 设为 `2` 时最坏情况为 `60s + 退避 + 60s + 退避 + 60s ≈ 180s`，大多数 Agent SDK 会先超时崩溃。建议维持默认 `0` 或至多 `1`。
+- 压缩 5xx 的 HTML 盲区：若上游返回 gzip 压缩的 HTML 错误页，网关读到的是压缩字节，`<html` 检测失效，退化为原样透传（与压缩 429 的分类器降级同款，可接受）。
+- 5xx 拦截/包装仅覆盖 chat 路径；passthrough 路径的 5xx 仍原样透传、不重试、不包装。
 - 空 `allowedUpstreamHosts` 默认允许任意上游：回环监听下本机网页可借网关盲打内网。共享机器请务必配置白名单。
 
 ---

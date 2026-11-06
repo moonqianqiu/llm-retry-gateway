@@ -75,6 +75,7 @@ type Config struct {
 	RetryAfterCapRatio       int        `json:"retryAfterCapRatio"`
 	ResponseHeaderTimeoutSec int        `json:"responseHeaderTimeoutSec"`
 	SmallRetryAfterFixed     bool       `json:"smallRetryAfterFixed"`
+	Max5xxRetries            int        `json:"max5xxRetries"`
 	QuotaExhaustedPatterns   []string   `json:"quotaExhaustedPatterns"`
 	RateLimitPatterns        []string   `json:"rateLimitPatterns"`
 }
@@ -185,6 +186,7 @@ func defaultConfig() *Config {
 		RetryAfterCapRatio:       4,
 		ResponseHeaderTimeoutSec: 120,
 		SmallRetryAfterFixed:     false,
+		Max5xxRetries:            0, // 默认不重试 5xx
 		QuotaExhaustedPatterns: []string{
 			"credit_balance_exhausted",
 			"organization_usage_limit_exceeded",
@@ -245,6 +247,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.ResponseHeaderTimeoutSec < 1 {
 		return fmt.Errorf("responseHeaderTimeoutSec must be >= 1, got %d", cfg.ResponseHeaderTimeoutSec)
+	}
+	if cfg.Max5xxRetries < 0 {
+		return fmt.Errorf("max5xxRetries must be >= 0, got %d", cfg.Max5xxRetries)
 	}
 	for name, ramp := range map[string]RampConfig{
 		"normalRamp":    cfg.NormalRamp,
@@ -473,6 +478,7 @@ func forwardWithRetry(ctx context.Context, upstreamURL string, bodyBytes []byte,
 
 	attempt := 0
 	rampIndex := 0
+	retry5xxCount := 0 // 502/503/504 的已用重试次数，独立于 429 的无限重试
 
 	for {
 		attempt++
@@ -505,6 +511,55 @@ func forwardWithRetry(ctx context.Context, upstreamURL string, bodyBytes []byte,
 		}
 
 		if resp.StatusCode != http.StatusTooManyRequests {
+			// 502/503/504：按 max5xxRetries 有限重试；耗尽后拦截 HTML 包装为 OpenAI 兼容 JSON。
+			if resp.StatusCode == http.StatusBadGateway ||
+				resp.StatusCode == http.StatusServiceUnavailable ||
+				resp.StatusCode == http.StatusGatewayTimeout {
+
+				bodySnippet, _ := readLimited(resp.Body, max429BodyBytes)
+				resp.Body.Close()
+
+				if retry5xxCount < cfg.Max5xxRetries {
+					retry5xxCount++
+					ramp := &cfg.NormalRamp
+					var capped time.Duration
+					if ra := parseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
+						capDelay := time.Duration(maxInt(ramp.DelaysMs)) * time.Millisecond *
+							time.Duration(cfg.RetryAfterCapRatio)
+						capped = ra
+						if capped > capDelay {
+							capped = capDelay
+						}
+					}
+					rampDelay := computeRampDelay(ramp, rampIndex)
+					delay := max(capped, rampDelay) // Retry-After 是下限；max 为 Go 1.21+ 内建
+					rampIndex++                     // 与 429 共享，保持退避曲线连续
+
+					logger.Warn("req=%s attempt=%d status=%d final=5xx_retry capped_ms=%d ramp_ms=%d sleep_ms=%d before_attempt=%d",
+						reqID, attempt, resp.StatusCode, capped.Milliseconds(), rampDelay.Milliseconds(),
+						delay.Milliseconds(), attempt+1)
+					if !sleepWithContext(ctx, delay) {
+						return nil, ctx.Err()
+					}
+					continue
+				}
+
+				logger.Info("req=%s attempt=%d status=%d retries_5xx_used=%d final=5xx_intercept",
+					reqID, attempt, resp.StatusCode, retry5xxCount)
+				lower := strings.ToLower(string(bodySnippet))
+				if strings.Contains(lower, "<html") || strings.Contains(lower, "<!doctype html") {
+					// HTML 错误页会令 OpenAI 兼容 SDK 解析崩溃，包装为 JSON。
+					errorJSON := fmt.Sprintf(`{"error": {"message": "Upstream returned %d with an HTML error page; intercepted and wrapped by llm-retry-gateway.", "type": "upstream_error"}}`, resp.StatusCode)
+					resp = buildSyntheticResponse(resp, []byte(errorJSON))
+					resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+					logger.Info("req=%s final=5xx_wrapped", reqID)
+				} else {
+					// JSON / 纯文本：原样透传。
+					resp = buildSyntheticResponse(resp, bodySnippet)
+				}
+				return resp, nil
+			}
+
 			logger.Info("req=%s attempt=%d status=%d final=ok", reqID, attempt, resp.StatusCode)
 			return resp, nil
 		}

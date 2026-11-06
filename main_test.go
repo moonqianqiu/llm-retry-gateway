@@ -403,11 +403,14 @@ func TestRepoConfigFileLoads(t *testing.T) {
 		t.Errorf("shipped config drifted: %+v", cfg)
 	}
 	// 新增字段的 shipped 默认值守卫（防止 config.json 漂移未同步测试）
-	if cfg.ResponseHeaderTimeoutSec != 120 {
-		t.Errorf("shipped config responseHeaderTimeoutSec = %d, want 120", cfg.ResponseHeaderTimeoutSec)
+	if cfg.ResponseHeaderTimeoutSec != 65 {
+		t.Errorf("shipped config responseHeaderTimeoutSec = %d, want 65", cfg.ResponseHeaderTimeoutSec)
 	}
 	if cfg.SmallRetryAfterFixed {
 		t.Error("shipped config smallRetryAfterFixed must be false")
+	}
+	if cfg.Max5xxRetries != 0 {
+		t.Errorf("shipped config max5xxRetries = %d, want 0", cfg.Max5xxRetries)
 	}
 }
 
@@ -424,6 +427,7 @@ func TestValidateConfigRejects(t *testing.T) {
 		{"zero delay", func(c *Config) { c.NormalRamp.DelaysMs = []int{0} }},
 		{"jitter > 1", func(c *Config) { c.AmbiguousRamp.JitterRatio = 1.5 }},
 		{"responseHeaderTimeoutSec=0", func(c *Config) { c.ResponseHeaderTimeoutSec = 0 }},
+		{"max5xxRetries=-1", func(c *Config) { c.Max5xxRetries = -1 }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -563,6 +567,112 @@ func TestE2E_NetworkError502NoRetry(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "upstream request failed") {
 		t.Errorf("body = %q", body)
+	}
+}
+
+func TestE2E_5xxRetryThenSuccess(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<html><body>502 Bad Gateway</body></html>"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: ok\n\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := testConfig()
+	cfg.Max5xxRetries = 1
+	gw := startGateway(t, cfg)
+	defer gw.Close()
+
+	resp, err := http.Post(gatewayTarget(gw, upstream, "/v1/chat/completions"),
+		"application/json", strings.NewReader(`{"model":"gpt-4o-mini"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", resp.StatusCode, body)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one 502 retry then success)", got)
+	}
+}
+
+func TestE2E_5xxHTMLWrappedAsJSON(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = w.Write([]byte("<!DOCTYPE html><html><body>504 Gateway Timeout</body></html>"))
+	}))
+	defer upstream.Close()
+
+	gw := startGateway(t, testConfig()) // Max5xxRetries 默认 0，不重试
+	defer gw.Close()
+
+	resp, err := http.Post(gatewayTarget(gw, upstream, "/v1/chat/completions"),
+		"application/json", strings.NewReader(`{"model":"gpt-4o-mini"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("content-type = %q, want application/json", ct)
+	}
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("body is not valid JSON: %v; body = %q", err, body)
+	}
+	if parsed.Error.Type != "upstream_error" {
+		t.Errorf("error.type = %q, want upstream_error", parsed.Error.Type)
+	}
+	if !strings.Contains(parsed.Error.Message, "504") {
+		t.Errorf("error.message = %q, want it to mention 504", parsed.Error.Message)
+	}
+}
+
+func TestE2E_5xxJSONPassthrough(t *testing.T) {
+	const upstreamBody = `{"error":{"message":"upstream boom","code":502}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer upstream.Close()
+
+	gw := startGateway(t, testConfig())
+	defer gw.Close()
+
+	resp, err := http.Post(gatewayTarget(gw, upstream, "/v1/chat/completions"),
+		"application/json", strings.NewReader(`{"model":"gpt-4o-mini"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if string(body) != upstreamBody {
+		t.Errorf("body = %q, want passthrough %q", body, upstreamBody)
 	}
 }
 
