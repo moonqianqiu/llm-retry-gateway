@@ -147,8 +147,9 @@ func parseLogLevel(s string) LogLevel {
 }
 
 // ---------------------------------------------------------------------------
-// 4. 包级共享 client（forwardWithRetry 与 handlePassthrough 共用，避免每请求
-//    Clone() 产生新连接池）
+// 4. HTTP client 构造（ResponseHeaderTimeout 由配置传入；main() 构造后经参数
+//    传递给 handle / handleChat / handlePassthrough / forwardWithRetry，
+//    无包级变量）
 // ---------------------------------------------------------------------------
 
 func newHTTPClient(respHeaderTimeout time.Duration) *http.Client {

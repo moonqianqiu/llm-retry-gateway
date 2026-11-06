@@ -21,7 +21,7 @@ Go 标准库 only，单文件 `main.go`，无第三方依赖，不管理任何 A
 - **只有 429 重试**，无限次，无 `maxRetries`；网络错误不重放非幂等 `POST`，直接 502。
 - **首字节前可重试，首字节后不回头**：`WriteHeader` 之后只做流式透传，绝不重试。
 - **分类驱动退避**：明确配额耗尽 / 明确瞬时限流 / 模糊配额 / 未分类，四类走不同 ramp。
-- **`Retry-After` 是延迟下限**（不是「优先使用」）：`delay = max(封顶后的 Retry-After, 缓坡延迟)`，缓坡保证退避不会永远卡在 1 秒。
+- **`Retry-After` 是延迟下限**（不是「优先使用」，`smallRetryAfterFixed: false` 时）：`delay = max(封顶后的 Retry-After, 缓坡延迟)`，缓坡保证退避不会永远卡在 1 秒。
 - **API Key 纯透传**：`Authorization` 原样转发，不注入、不兜底、不读环境变量。
 - **请求体原样透传**：不解析模型参数；chat 路径读入内存以支持重放，其余路径直接流式转发。
 - **默认只放行 `https://` 上游 + 只监听回环地址**，避免 Key 明文出网。
@@ -122,6 +122,8 @@ retryAfterCapped = min(parseRetryAfter(Retry-After), 所选 ramp 的 max(delaysM
 rampDelay        = computeRampDelay(ramp, rampIndex)
 delay            = max(retryAfterCapped, rampDelay)      # Retry-After 是下限
 rampIndex++                                             # 恒递增
+
+# 实际生效（decideDelay）：
 delay = decideDelay(retryAfterCapped, rampDelay, min(delaysMs), jitterRatio, smallRetryAfterFixed)
       ├─ smallRetryAfterFixed && 0 < retryAfterCapped <= min(delaysMs) → min(delaysMs) × 抖动
       └─ 否则                                                          → max(retryAfterCapped, rampDelay)
@@ -208,7 +210,7 @@ Te, Trailer, Transfer-Encoding, Upgrade, Proxy-Connection
 
 **加载顺序**：默认值 → `config.json` → 环境变量 `LISTEN` / `LOG_LEVEL`。
 
-**启动校验**（任一失败即退出）：配置文件存在且可解析；`listen` 为回环地址；`maxBodyBytes >= 1024`；`retryAfterCapRatio >= 1`；两个 ramp 的 `delaysMs` 非空且全部 `> 0`、`jitterRatio ∈ [0,1]`。
+**启动校验**（任一失败即退出）：配置文件存在且可解析；`listen` 为回环地址；`maxBodyBytes >= 1024`；`retryAfterCapRatio >= 1`；`responseHeaderTimeoutSec >= 1`；两个 ramp 的 `delaysMs` 非空且全部 `> 0`、`jitterRatio ∈ [0,1]`。
 
 `max429BodyBytes` 是编译期常量 `64 * 1024`，**不是配置项**：429 响应体读取上限与请求体上限解耦，分类只需 body 前缀做子串匹配。
 
@@ -297,7 +299,7 @@ Key 池 / 轮换 / 降级、主动限流、配置热重载、Web UI、完整 SSE
 8.  classify / extractTextForMatching / readLimited
 9.  computeRampDelay / parseRetryAfter / sleepWithContext / rampFor
 10. streamResponse / copyHeader / delHopByHop / writeJSONError
-11. newRequestID / maxInt
+11. newRequestID / minInt / maxInt
 ```
 
 ---

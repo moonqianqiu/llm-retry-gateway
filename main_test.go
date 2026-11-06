@@ -402,6 +402,13 @@ func TestRepoConfigFileLoads(t *testing.T) {
 	if cfg.Listen != "127.0.0.1:18888" || cfg.MaxBodyBytes != 262144 || cfg.RetryAfterCapRatio != 4 {
 		t.Errorf("shipped config drifted: %+v", cfg)
 	}
+	// 新增字段的 shipped 默认值守卫（防止 config.json 漂移未同步测试）
+	if cfg.ResponseHeaderTimeoutSec != 120 {
+		t.Errorf("shipped config responseHeaderTimeoutSec = %d, want 120", cfg.ResponseHeaderTimeoutSec)
+	}
+	if cfg.SmallRetryAfterFixed {
+		t.Error("shipped config smallRetryAfterFixed must be false")
+	}
 }
 
 func TestValidateConfigRejects(t *testing.T) {
