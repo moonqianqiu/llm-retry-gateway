@@ -437,7 +437,7 @@ func handleChat(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *Config,
 	}
 	defer resp.Body.Close()
 
-	streamResponse(w, resp, logger, reqID)
+	streamResponse(ctx, w, resp, logger, reqID)
 }
 
 func handlePassthrough(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *Config, logger *Logger, client *http.Client) {
@@ -466,7 +466,7 @@ func handlePassthrough(w http.ResponseWriter, r *http.Request, u *url.URL, cfg *
 	}
 	defer resp.Body.Close()
 
-	streamResponse(w, resp, logger, reqID)
+	streamResponse(ctx, w, resp, logger, reqID)
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +761,7 @@ func parseRetryAfter(v string) time.Duration {
 // 10. 流式透传 / Header / 错误响应
 // ---------------------------------------------------------------------------
 
-func streamResponse(w http.ResponseWriter, resp *http.Response, logger *Logger, reqID string) {
+func streamResponse(ctx context.Context, w http.ResponseWriter, resp *http.Response, logger *Logger, reqID string) {
 	delHopByHop(resp.Header)
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -772,6 +772,8 @@ func streamResponse(w http.ResponseWriter, resp *http.Response, logger *Logger, 
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
+				// 客户端断开时，Write 通常会立刻报错
+				logger.Debug("req=%s stream write error (client gone?): %v", reqID, werr)
 				return
 			}
 			if flusher != nil {
@@ -780,7 +782,13 @@ func streamResponse(w http.ResponseWriter, resp *http.Response, logger *Logger, 
 		}
 		if err != nil {
 			if err != io.EOF {
-				logger.Warn("req=%s stream copy error: %v", reqID, err)
+				if ctx.Err() != nil {
+					// 客户端断开导致请求 context 取消：正常高频现象，降级为 Debug
+					logger.Debug("req=%s stream closed by client", reqID)
+				} else {
+					// context 没取消但 Read 报错，说明是上游服务端异常中断，保留 Warn
+					logger.Warn("req=%s stream copy error: %v", reqID, err)
+				}
 			}
 			return
 		}
